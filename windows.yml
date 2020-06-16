@@ -1,0 +1,328 @@
+---
+########################################################################################################################################################################
+#       PLAYBOOK DESCRIPTION: This Playbook is designed for getting the CPU usage percentage of remote windows machine and find out the top  processes consuming       #
+#                             more CPU. Post getting process details check if the process is killable, If Yes proceed and kill the process, If No stop playbook.       #
+#                             update the result in the ticket according to the resut                                                                                   #
+#       AUTHOR: Monohar Behera                                                                                                                                         #
+#       VERSION: 4.0                                                                                                                                                   #
+#       FIXES: Used different command to fetch the CPU percentage (issue came in production)                                                                           #########################################################################################################################################################################
+
+
+  - name: Windows CPU Threshold Check
+    hosts: all
+    gather_facts: no
+    become: no
+    vars:
+     ip: '{{ip}}'
+     bot_name: '{{bot_name}}'
+     ticketNo: '{{ticketNo}}'
+
+
+    tasks:
+#-----------------------------------------------Calling the action plugin to fetch the parameter required through lookup-----------------------------------------------#
+    - block:
+      - name: User message while triggering the Bot
+        set_fact:
+         bot_trigger: "'{{bot_name}}' - Bot execution started"
+
+      - name: Ticket Update on Bot trigger
+        action: worknotesupdate work_notes='{{bot_trigger}}'
+
+
+      - name: Lookup to fetch all the parameter required for this playbook
+        action: generic_lookup type=cpu_windows
+        register: output
+
+      - name: Storing the data  into variable
+        set_fact:
+          cpu_threshold: '{{output.lookups.threshold}}' # CPU load percentage threshold
+          process_number: '{{output.lookups.number_of_processes}}' #Number of Processes to be fetched
+          wait_time: '{{output.lookups.wait_time}}' #Number of seconds the playbook should sleep before checking the CPU threshold
+          check_counter: '{{output.lookups.retry}}'
+          killable_process_list: '{{output.lookups.process}}'  # list of processes not to be killed
+          cpu_threshold_to_be_validated: '{{output.lookups.threshold|int -1}}'
+
+
+
+#-----------------------------------------------Calculating the time interval between each counter to check the CPU Load-----------------------------------------------#
+
+      - name: Calculating the Time interval betweeen check
+        set_fact:
+          time_interval: '{{ ((wait_time|int * 60)  / check_counter|int)|int }}'
+
+
+      - name: Craeting a temporary file in windows system
+        win_shell: $data = Get-Item -Path .\{{ticketNo}}ansible_temp.json -ErrorAction SilentlyContinue; if ($data.Name -ne $null){Clear-Content -Path .\{{ticketNo}}ansible_temp.json -ErrorAction SilentlyContinue} if($data -eq $null){New-Item -Path .\{{ticketNo}}ansible_temp.json -ItemType File -ErrorAction SilentlyContinue}	
+
+
+
+#-----------------------------------------------------------Fetching the Load percentage of CPU post sleep-------------------------------------------------------------#
+
+      - name: Getting Windows CPU Load Percentage
+        win_shell: |
+            $date = Get-Date|select DateTime |Out-File -Append -FilePath .\{{ticketNo}}ansible_temp.json |Out-String
+            $cpu = (get-counter -Counter '\Processor(_Total)\% Processor Time' )
+            $cpu_percent = [int]($cpu.readings -split ":")[-1]
+            $cpu_percent
+            $cpu_log = "LoadPercentage=$cpu_percent"
+            $log = $cpu_log |Out-File -Append -FilePath .\{{ticketNo}}ansible_temp.json
+            $process = Get-Process | Sort CPU -descending | Select -first '{{process_number}}'  -Property ProcessName  -ErrorAction SilentlyContinue|Out-File -Append -FilePath .\{{ticketNo}}ansible_temp.json
+  
+        register: cpu_load_percentage
+        retries: '{{check_counter|int }}'
+        delay: '{{time_interval}}'
+        until: '{{cpu_load_percentage.stdout|trim|int}} < {{cpu_threshold|int}}' 
+        ignore_errors: yes
+      
+
+
+      - name: Collecting the output for each number of Retries
+        win_shell: (Get-Content -Path .\{{ticketNo}}ansible_temp.json|Out-String).Trim()
+        register: collected_data
+
+      - name: Storing the collected data into a variable
+        set_fact:
+          collected_data_tkt_update: "{{collected_data.stdout}}"
+          collected_data: "{{collected_data.stdout_lines}}"
+#----------------------------------------------------------------------updating the ticket work notes------------------------------------------------------------------#
+
+      - name: Work notes action plugin
+        action: worknotesupdate work_notes='{{collected_data_tkt_update}}'
+
+
+        
+      - name: Storing the CPU Load result into a variable
+        set_fact:
+          cpu_load: "{{cpu_load_percentage.stdout|int| trim |replace(' ','')}}"
+
+      - name: Delete the Temporary file which is created for storing the result of each iteration
+        win_shell: (Remove-Item -Path .\{{ticketNo}}ansible_temp.json -Force -ErrorAction SilentlyContinue |Out-String).Trim()
+
+
+
+#----------------------------------This Block will execute when the CPU isbelow breached within given wait time--------------------------------------------------------#
+
+############### Starting of Block #############
+      - block:
+###############################################
+#----------------------------------------------------------------------Creating a custom message-----------------------------------------------------------------------#
+
+
+        - name: Message if CPU load is less than the Threshold
+          set_fact:
+            message: "cpu utilization is below threshold within {{wait_time}} Minutes "
+
+        - name: save_output
+          set_fact:
+            aa_start_save: ''
+            process_data: '{{collected_data}}'
+            user_message: '{{message}}'
+            success_type: 't2'
+            status_code: '0'
+            zz_end_save: ''
+
+        - name: Work notes action plugin message
+          action: worknotesupdate work_notes='{{message}}'
+
+
+#----------------------------------------------------------Stop Playbook execution if CPU utilization is below threshold-----------------------------------------------#
+
+        - meta: end_host
+################################################
+        when: cpu_load|int < cpu_threshold|int
+############# Ending of Block ##################
+
+
+
+#----------------------------------This Block will execute when the CPU threshold is breached--------------------------------------------------------------------------#
+
+####### Starting of Block #######
+      - block:
+#################################
+      
+        - block:
+          - name: Checking if the process list is blank or not
+            set_fact:
+              message: "cpu utilization is still above threshold, No defined process to be killed. Please check manually."
+
+          - name: save_output
+            set_fact:
+              aa_start_save: ''
+              process_data: '{{collected_data}}'
+              user_message: '{{message}}'
+              status_code: '1'
+              zz_end_save: ''
+
+          - name:  Work notes action plugin message
+            action: worknotesupdate work_notes='{{message}}'
+
+          - name: Fail task
+            fail:
+              msg: Playbook failed as CPU  is still above threshold and No process is killed.
+  
+          - meta: end_host
+          when: killable_process_list == []
+
+
+  
+
+        - block: 
+          - name: Craeting a temporary file in windows system
+            win_shell: $data = Get-Item -Path .\{{ticketNo}}process_kill_status.json -ErrorAction SilentlyContinue; if ($data.Name -ne $null){Clear-Content -Path .\{{ticketNo}}process_kill_status.json -ErrorAction SilentlyContinue} if($data -eq $null){New-Item -Path .\{{ticketNo}}process_kill_status.json -ItemType File -ErrorAction SilentlyContinue}
+
+
+          - name: Getting  process names to be killed
+            win_shell: (Get-Process | Sort CPU -descending | Select -first '{{process_number}}' -Property ProcessName  -ErrorAction SilentlyContinue | format-table  -HideTableHeaders |Out-String).trim()
+            register: process_names
+
+
+          - name: Storing the result into a variable
+            set_fact:
+              process_names: "{{process_names.stdout_lines|unique|  trim |replace(' ','')}}"
+
+
+
+
+#-----------------------------------------------------------------Killing the top cpu consuming processes--------------------------------------------------------------#
+          - name: Capturing the server date and time
+            win_shell: $date = Get-Date|select DateTime |Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json |Out-String
+
+          - name: Stopping the process
+            win_shell: |
+                $kill_process = Stop-Process -Name {{item}} -Force -ErrorAction SilentlyContinue; if ($?){"{{item}} Process Kill Success"|Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json} else {"{{item}} Process Kill Failed"|Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json}
+            with_items: '{{process_names}}'
+            ignore_errors: True
+            when: item in killable_process_list
+#--------------------------------------------Post process killing keeping the playbook into sleep for specified time---------------------------------------------------#
+
+
+          - name: Putting the playbook in sleep mode
+            pause:
+              seconds: '{{time_interval}}'
+
+
+          - name: Collecting the output for each number of Retries
+            win_shell: (Get-Content -Path .\{{ticketNo}}process_kill_status.json|Out-String).Trim()
+            register: kill_chk
+
+          - name: storing the result
+            set_fact:
+              kill_chk: '{{kill_chk.stdout_lines}}'
+          
+
+          - name: storing the kill code into a variable
+            set_fact:
+              kill_code: "0"
+            when: '"Pocess Kill" in {{kill_chk}}'
+
+          - name: storing the kill code into a variable
+            set_fact:
+              kill_code: "1"
+            when: '"Process Kill" not in {{kill_chk}}'
+
+
+          - name: Capturing the server date and time
+            win_shell: $msg="No process is killed as top consuming processes doesn't match with the killable processes"  |Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json |Out-String
+            when: '{{kill_code}}==1'
+
+
+#-----------------------------------------Post process kill and sleep checking the current cpu load in percentage------------------------------------------------------#
+
+
+          - name: Checking Current Load
+            win_shell: |
+                $date = Get-Date|select DateTime |Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json |Out-String
+                $cpu = (get-counter -Counter '\Processor(_Total)\% Processor Time')
+                $cpu_percent = [int]($cpu.readings -split ":")[-1]
+                $cpu_percent
+                $cpu_log = "LoadPercentage=$cpu_percent"
+                $log = $cpu_log |Out-File -Append -FilePath .\{{ticketNo}}process_kill_status.json
+            register: current_load
+
+
+          - name: Storing the result into a variable
+            set_fact:
+              current_load: '{{current_load.stdout|trim|int| trim }}'
+
+
+
+#----------------------------------------------------------------------Creating a custom message-----------------------------------------------------------------------#
+
+
+          - name: Message if CPU load is less than the Threshold Post process Kill
+            set_fact:
+              message: "cpu utilization is below threshold after killing the processes"
+              code: '0'
+            when: "'{{current_load|int}} < {{cpu_threshold|int}}' and {{kill_code}}==0"
+
+
+          - name: Message if CPU load is not below Threshold Post process Kill
+            set_fact:
+              message: "cpu utilization is still high after killing the processes"
+              code: '1'
+            when: "'{{current_load|int}} >= {{cpu_threshold|int}}' and {{kill_code}}==0"
+
+
+          - name: Message if CPU load is less than the Threshold without process Kill
+            set_fact:
+              message: "cpu utilization is below threshold without killing any process"
+              code: '0'
+            when: "'{{current_load|int}} < {{cpu_threshold|int}}' and {{kill_code}}==1"
+
+
+          - name: Message if CPU load is not below Threshold Post process Kill
+            set_fact:
+              message: "cpu utilization is still high as no process is killed"
+              code: '1'
+            when: "'{{current_load|int}} >= {{cpu_threshold|int}}' and {{kill_code}}==1"
+
+
+    
+          - name: Collecting the output for process kill data from the temp file
+            win_shell: (Get-Content -Path .\{{ticketNo}}process_kill_status.json|Out-String).Trim()
+            register: kill_status
+          - name: storing the kill status into a variable
+            set_fact:
+              kill_status_tkt_update: '{{kill_status.stdout}}'
+              kill_status: '{{kill_status.stdout_lines}}'
+
+          - name: Work notes action plugin
+            action: worknotesupdate work_notes='{{kill_status_tkt_update}}'
+
+
+          - name: Delete the Temporary file which is created for storing the result
+            win_shell: (Remove-Item -Path .\{{ticketNo}}process_kill_status.json -Force -ErrorAction SilentlyContinue |Out-String).Trim()
+
+
+#-----------------------------------------------------Creating a custom json output and calling the plugin-------------------------------------------------------------#
+
+          - name: save_output
+            set_fact:
+              aa_start_save: ''
+              process_data: '{{collected_data}}'
+              process_kill_status: '{{kill_status}}'
+              user_message: '{{message}}'
+              success_type: 't1'
+              status_code: '{{code}}'
+              zz_end_save: ''
+
+          - name:  Work notes action plugin message
+            action: worknotesupdate work_notes='{{message}}'
+
+          - name: Fail task
+            fail:
+              msg: Playbook failed as CPU  is still above threshold
+            when: '{{current_load|int}} >= {{cpu_threshold|int}}'
+          - meta: end_host
+          when: killable_process_list != ""
+
+
+
+        - meta: end_host
+################################################
+        when: '{{cpu_load}} >= {{cpu_threshold}}'
+############# Ending of Block ##################
+
+#-----------------------------------------------------------------------------Ending of Playbook-----------------------------------------------------------------------#
+    
+      when: "inventory_hostname == ip"
